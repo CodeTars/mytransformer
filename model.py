@@ -1,12 +1,13 @@
 import torch
+import torch.nn.functional as F
 
-# transformer流程   
+# transformer流程
 # 1. 输入嵌入：将输入的prompt分词、转换为带隐式维度向量
 # 2. 位置编码：暂时实现绝对位置编码
 # 3. n * TransformerBlock
 #   3.a 单头注意力
 #
-# 暂时不考虑输入嵌入和绝对位置编码，输入3开始
+# 暂时不考虑输入嵌入和绝对位置编码，从3开始
 
 B = 10
 prompt_len = 100
@@ -16,18 +17,17 @@ n = 24
 
 
 class LayerNorm:
-    def __init__(self, eps, gamma, beta):
+    def __init__(self, dim: int, eps: float = 1e-5):
         self.eps = eps
-        self.gamma = gamma
-        self.beta = beta
-    
+        self.gamma = torch.ones(dim)
+        self.beta = torch.zeros(dim)
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # X: (B, L, d)
-        mean = X.mean(dim = -1, keepdim = True) # (B, L, 1)
-        var = ((X - mean) ** 2).mean(dim = -1, keepdim = True) # (B, L, 1)
-        X_hat = (X - mean) / torch.sqrt(var + self.eps) # (B, L, d)
-        Y = self.gamma * X_hat + self.beta  # (B, L, d)
-        return Y
+        # X: (B, Lq, d)
+        mean = X.mean(dim=-1, keepdim=True)  # (B, Lq, 1)
+        var = ((X - mean) ** 2).mean(dim=-1, keepdim=True)  # (B, Lq, 1)
+        X_hat = (X - mean) / torch.sqrt(var + self.eps)
+        return self.gamma * X_hat + self.beta
 
 
 class FFN:
@@ -40,10 +40,10 @@ class FFN:
         self.b1 = torch.randn(self.d_up)
         self.W2 = torch.randn(self.d_up, d)
         self.b2 = torch.randn(d)
-    
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         # X: (B, L, d)
-        return torch.nn.functional.gelu(X @ self.W1 + self.b1) @ self.W2 + self.b2
+        return F.gelu(X @ self.W1 + self.b1) @ self.W2 + self.b2
 
 
 class TransformerBlock:
@@ -53,50 +53,66 @@ class TransformerBlock:
         self.W_K = torch.randn(d, d_k)
         self.W_V = torch.randn(d, d_k)
         self.W_O = torch.randn(d_k, d)
-        self.layer_norm1 = LayerNorm(eps = 1e-5, gamma = torch.randn(d), beta = torch.randn(d))
-        self.layer_norm2 = LayerNorm(eps = 1e-5, gamma = torch.randn(d), beta = torch.randn(d))
+        self.layer_norm1 = LayerNorm(d)
+        self.layer_norm2 = LayerNorm(d)
         self.ffn = FFN()
+        self.reset_cache()
+
+    def reset_cache(self):
+        # KV cache，序列维初始长度为 0
         self.K = torch.zeros(B, 0, d_k)
         self.V = torch.zeros(B, 0, d_k)
-    
+
+    def _causal_mask(self, q_len: int, k_len: int) -> torch.Tensor:
+        # query 绝对位置: [k_len - q_len, ..., k_len - 1]
+        # 位置 i 只能看见 j <= i
+        # prefill (q_len == k_len): 标准上三角
+        # decode  (q_len == 1)   : 可看见全部已缓存 key，等价于不遮挡
+        offset = k_len - q_len
+        return torch.triu(
+            torch.full((q_len, k_len), float("-inf")),
+            diagonal=offset + 1,
+        )
+
     def attention(self, X: torch.Tensor) -> torch.Tensor:
-        # X: prefill: (B, L, d), decode: (B, 1, d)
-        Q = X @ self.W_Q    # prefill: (B, L, d_k), decode: (B, 1, d_k)
+        # X: (B, Lq, d)
+        # self.K/V 已包含当前步（含 cache）
+        Q = X @ self.W_Q  # (B, Lq, d_k)
+        Lq, Lk = Q.shape[-2], self.K.shape[-2]
 
-        scores = Q @ self.K.transpose(-2, -1) / (d_k ** 0.5) # prefill: (B, L, L), decode: (B, 1, L)
-        # 因果掩码
-        q_len = Q.shape[-2], k_len = self.K.shape[-2]
-        mask = torch.triu(torch.full((q_len, k_len), float("-inf")), diagonal = 1)
-        A = torch.softmax(scores + mask, dim = -1) # 注意力权重矩阵 prefill: (B, L, L)
-        Y = A @ self.V   # 注意力输出，根据注意力权重交换不同token的信息 prefill: (B, L, d_k), decode: (B, 1, d_k)
+        scores = Q @ self.K.transpose(-2, -1) / (d_k ** 0.5)  # (B, Lq, Lk)
+        scores = scores + self._causal_mask(Lq, Lk)
+        A = torch.softmax(scores, dim=-1)  # (B, Lq, Lk)
+        Y = A @ self.V  # (B, Lq, d_k)
+        return Y @ self.W_O  # (B, Lq, d)
 
-        return Y @ self.W_O # prefill: (B, L, d), decode: (B, 1, d)
-        
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # X: (B, L, d) or (B, 1, d)
-        # 做输入张量归一化
+        # X: (B, Lq, d)  —— Pre-LN
         X_norm = self.layer_norm1.forward(X)
-        # K V投影
-        k = X_norm @ self.W_K    # (B, L, d_k) or (B, 1, d_k)
-        v = X_norm @ self.W_V    # (B, L, d_k) or (B, 1, d_k)
-        self.K = torch.cat([self.K, k], dim=-2)
-        self.V = torch.cat([self.V, v], dim=-2)
-        # Self-Attention
-        attention_result = self.attention(X_norm) # (B, L, d) or (B, 1, d)
-        # 残差连接
-        H = X + attention_result # (B, L, d)
-        # 第二次张量归一化
-        H_norm = self.layer_norm2.forward(H) # (B, L, d)
-        # 做一次FFN
-        ffn_result = self.ffn.forward(H_norm) # (B, L, d)
-        # 残差连接
-        Y = H + ffn_result # (B, L, d)
+
+        # 投影并追加到 KV cache, (B, Lk, d)，满足 1 <= Lq <= Lk
+        self.K = torch.cat([self.K, X_norm @ self.W_K], dim=-2)
+        self.V = torch.cat([self.V, X_norm @ self.W_V], dim=-2)
+
+        H = X + self.attention(X_norm) # (B, Lq, d)
+        Y = H + self.ffn.forward(self.layer_norm2.forward(H)) # (B, Lq, d)
         return Y
 
 
 def main():
-    X = 0.02 * torch.randn(B, prompt_len, d)  # 99.7% 落在[-0.06, 0.06]
-    blocks = [TransformerBlock() for i in range(0, n)]
+    X = 0.02 * torch.randn(B, prompt_len, d)  # 99.7% 落在 [-0.06, 0.06]
+    blocks = [TransformerBlock() for _ in range(n)]
+
+    # prefill：整段 prompt 一次过完
+    for block in blocks:
+        X = block.forward(X)
+    print("prefill:", X.shape)
+
+    # decode：每次 1 个 token，KV cache 继续增长
+    token = 0.02 * torch.randn(B, 1, d)
+    for block in blocks:
+        token = block.forward(token)
+    print("decode:", token.shape)
 
 
 if __name__ == "__main__":
