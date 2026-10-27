@@ -12,7 +12,9 @@ import torch.nn.functional as F
 B = 10
 prompt_len = 100
 d = 100
-d_k = 100
+h = 4
+d_k = 25
+d_v = 25
 n = 24
 
 
@@ -48,11 +50,12 @@ class FFN:
 
 class TransformerBlock:
     def __init__(self):
-        # 暂时实现单头注意力
-        self.W_Q = torch.randn(d, d_k)
-        self.W_K = torch.randn(d, d_k)
-        self.W_V = torch.randn(d, d_k)
-        self.W_O = torch.randn(d_k, d)
+        assert d_k == d_v
+        assert d == d_k * h
+        self.W_Q = torch.randn(d, d_k * h)
+        self.W_K = torch.randn(d, d_k * h)
+        self.W_V = torch.randn(d, d_v * h)
+        self.W_O = torch.randn(d_v * h, d)
         self.layer_norm1 = LayerNorm(d)
         self.layer_norm2 = LayerNorm(d)
         self.ffn = FFN()
@@ -60,8 +63,8 @@ class TransformerBlock:
 
     def reset_cache(self):
         # KV cache，序列维初始长度为 0
-        self.K = torch.zeros(B, 0, d_k)
-        self.V = torch.zeros(B, 0, d_k)
+        self.K = torch.zeros(B, h, 0, d_k)
+        self.V = torch.zeros(B, h, 0, d_v)
 
     def _causal_mask(self, q_len: int, k_len: int) -> torch.Tensor:
         # query 绝对位置: [k_len - q_len, ..., k_len - 1]
@@ -74,27 +77,33 @@ class TransformerBlock:
             diagonal=offset + 1,
         )
 
-    def attention(self, X: torch.Tensor) -> torch.Tensor:
-        # X: (B, Lq, d)
+    def attention(self, Q: torch.Tensor) -> torch.Tensor:
         # self.K/V 已包含当前步（含 cache）
-        Q = X @ self.W_Q  # (B, Lq, d_k)
         Lq, Lk = Q.shape[-2], self.K.shape[-2]
-
-        scores = Q @ self.K.transpose(-2, -1) / (d_k ** 0.5)  # (B, Lq, Lk)
+        scores = Q @ self.K.transpose(-2, -1) / (d_k ** 0.5)  # (B, h, Lq, Lk)
         scores = scores + self._causal_mask(Lq, Lk)
-        A = torch.softmax(scores, dim=-1)  # (B, Lq, Lk)
-        Y = A @ self.V  # (B, Lq, d_k)
-        return Y @ self.W_O  # (B, Lq, d)
+        A = torch.softmax(scores, dim=-1)  # (B, h, Lq, Lk)
+
+        O = A @ self.V  # (B, h, Lq, d_v)
+        O = O.transpose(1, 2).reshape(B, Lq, h * d_v) # (B, Lq, d)
+        
+        return O @ self.W_O  # (B, Lq, d)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         # X: (B, Lq, d)  —— Pre-LN
-        X_norm = self.layer_norm1.forward(X)
+        X_norm = self.layer_norm1.forward(X) # (B, Lq, d)
 
-        # 投影并追加到 KV cache, (B, Lk, d)，满足 1 <= Lq <= Lk
-        self.K = torch.cat([self.K, X_norm @ self.W_K], dim=-2)
-        self.V = torch.cat([self.V, X_norm @ self.W_V], dim=-2)
+        Q = X_norm @ self.W_Q # (B, Lq, h * d_k)
+        K = X_norm @ self.W_K # (B, Lq, h * d_k)
+        V = X_norm @ self.W_V # (B, Lq, h * d_v)
 
-        H = X + self.attention(X_norm) # (B, Lq, d)
+        # 投影并追加到 KV cache, 满足 1 <= Lq <= Lk
+        Lq = Q.shape[1]
+        Q = Q.view(B, Lq, h, d_k).transpose(1, 2) # (B, h, Lq, d_k)
+        self.K = torch.cat([self.K, K.view(B, Lq, h, d_k).transpose(1, 2)], dim=-2) # (B, h, Lk, d_k)
+        self.V = torch.cat([self.V, V.view(B, Lq, h, d_v).transpose(1, 2)], dim=-2) # (B, h, Lk, d_v)
+
+        H = X + self.attention(Q) # (B, Lq, d)
         Y = H + self.ffn.forward(self.layer_norm2.forward(H)) # (B, Lq, d)
         return Y
 
