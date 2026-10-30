@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 
@@ -7,7 +8,6 @@ import torch.nn.functional as F
 # 3. n * TransformerBlock
 #   3.a 单头注意力
 #
-# 暂时不考虑输入嵌入和绝对位置编码，从3开始
 
 B = 10
 prompt_len = 100
@@ -16,6 +16,7 @@ h = 4
 d_k = 25
 d_v = 25
 n = 24
+base = 10000
 
 
 class LayerNorm:
@@ -77,7 +78,17 @@ class TransformerBlock:
             diagonal=offset + 1,
         )
 
-    def attention(self, Q: torch.Tensor) -> torch.Tensor:
+    def attention(self, X: torch.Tensor) -> torch.Tensor:
+        Q = X @ self.W_Q # (B, Lq, h * d_k)
+        K = X @ self.W_K # (B, Lq, h * d_k)
+        V = X @ self.W_V # (B, Lq, h * d_v)
+
+        # 投影并追加到 KV cache, 满足 1 <= Lq <= Lk
+        Lq = Q.shape[1]
+        Q = Q.view(B, Lq, h, d_k).transpose(1, 2) # (B, h, Lq, d_k)
+        self.K = torch.cat([self.K, K.view(B, Lq, h, d_k).transpose(1, 2)], dim=-2) # (B, h, Lk, d_k)
+        self.V = torch.cat([self.V, V.view(B, Lq, h, d_v).transpose(1, 2)], dim=-2) # (B, h, Lk, d_v)
+
         # self.K/V 已包含当前步（含 cache）
         Lq, Lk = Q.shape[-2], self.K.shape[-2]
         scores = Q @ self.K.transpose(-2, -1) / (d_k ** 0.5)  # (B, h, Lq, Lk)
@@ -90,26 +101,22 @@ class TransformerBlock:
         return O @ self.W_O  # (B, Lq, d)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # X: (B, Lq, d)  —— Pre-LN
-        X_norm = self.layer_norm1.forward(X) # (B, Lq, d)
-
-        Q = X_norm @ self.W_Q # (B, Lq, h * d_k)
-        K = X_norm @ self.W_K # (B, Lq, h * d_k)
-        V = X_norm @ self.W_V # (B, Lq, h * d_v)
-
-        # 投影并追加到 KV cache, 满足 1 <= Lq <= Lk
-        Lq = Q.shape[1]
-        Q = Q.view(B, Lq, h, d_k).transpose(1, 2) # (B, h, Lq, d_k)
-        self.K = torch.cat([self.K, K.view(B, Lq, h, d_k).transpose(1, 2)], dim=-2) # (B, h, Lk, d_k)
-        self.V = torch.cat([self.V, V.view(B, Lq, h, d_v).transpose(1, 2)], dim=-2) # (B, h, Lk, d_v)
-
-        H = X + self.attention(Q) # (B, Lq, d)
+        H = X + self.attention(self.layer_norm1.forward(X)) # (B, Lq, d)
         Y = H + self.ffn.forward(self.layer_norm2.forward(H)) # (B, Lq, d)
         return Y
 
 
 def main():
-    X = 0.02 * torch.randn(B, prompt_len, d)  # 99.7% 落在 [-0.06, 0.06]
+
+    E = 0.02 * torch.randn(B, prompt_len, d)  # 99.7% 落在 [-0.06, 0.06]
+    P = torch.zeros(B, prompt_len, d)
+    for pos in range(prompt_len):
+        for i in range(d // 2):
+            w = base ** (-2 * i / d)
+            P[:, pos, 2 * i]     = math.sin(pos * w)
+            P[:, pos, 2 * i + 1] = math.cos(pos * w)
+    X = E + P
+
     blocks = [TransformerBlock() for _ in range(n)]
 
     # prefill：整段 prompt 一次过完
@@ -118,10 +125,17 @@ def main():
     print("prefill:", X.shape)
 
     # decode：每次 1 个 token，KV cache 继续增长
-    token = 0.02 * torch.randn(B, 1, d)
-    for block in blocks:
-        token = block.forward(token)
-    print("decode:", token.shape)
+    P_token = torch.zeros(B, 1, d)
+    for i in range(20):
+        pos = prompt_len + i
+        for j in range(d // 2):
+            w = base ** (-2 * j / d)
+            P_token[:, :, 2 * j]     = math.sin(pos * w)
+            P_token[:, :, 2 * j + 1] = math.cos(pos * w)
+        token = 0.02 * torch.randn(B, 1, d) + P_token
+        for block in blocks:
+            token = block.forward(token)
+        print("decode:", token.shape)
 
 
 if __name__ == "__main__":
